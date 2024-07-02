@@ -11,7 +11,6 @@
 #include "pycore_object_stack.h"
 #include "pycore_pyerrors.h"
 #include "pycore_pystate.h"       // _PyThreadState_GET()
-#include "pycore_time.h"          // _PyTime_GetPerfCounter()
 #include "pycore_tstate.h"        // _PyThreadStateImpl
 #include "pycore_weakref.h"       // _PyWeakref_ClearRef()
 #include "pydtrace.h"
@@ -87,7 +86,7 @@ worklist_pop(struct worklist *worklist)
     PyObject *op = (PyObject *)worklist->head;
     if (op != NULL) {
         worklist->head = op->ob_tid;
-        op->ob_tid = 0;
+        _Py_atomic_store_uintptr_relaxed(&op->ob_tid, 0);
     }
     return op;
 }
@@ -190,6 +189,7 @@ merge_refcount(PyObject *op, Py_ssize_t extra)
 static void
 gc_restore_tid(PyObject *op)
 {
+    assert(_PyInterpreterState_GET()->stoptheworld.world_stopped);
     mi_segment_t *segment = _mi_ptr_segment(op);
     if (_Py_REF_IS_MERGED(op->ob_ref_shared)) {
         op->ob_tid = 0;
@@ -252,6 +252,10 @@ gc_visit_heaps_lock_held(PyInterpreterState *interp, mi_block_visit_fun *visitor
     // visit each thread's heaps for GC objects
     for (PyThreadState *p = interp->threads.head; p != NULL; p = p->next) {
         struct _mimalloc_thread_state *m = &((_PyThreadStateImpl *)p)->mimalloc;
+        if (!_Py_atomic_load_int(&m->initialized)) {
+            // The thread may not have called tstate_mimalloc_bind() yet.
+            continue;
+        }
 
         arg->offset = offset_base;
         if (!mi_heap_visit_blocks(&m->heaps[_Py_MIMALLOC_HEAP_GC], true,
@@ -677,7 +681,6 @@ call_weakref_callbacks(struct collection_state *state)
             Py_DECREF(temp);
         }
 
-        gc_restore_tid(op);
         Py_DECREF(op);  // drop worklist reference
     }
 }
@@ -704,11 +707,9 @@ _PyGC_Init(PyInterpreterState *interp)
 {
     GCState *gcstate = &interp->gc;
 
-    if (_Py_IsMainInterpreter(interp)) {
-        // gh-117783: immortalize objects that would use deferred refcounting
-        // once the first non-main thread is created.
-        gcstate->immortalize.enable_on_thread_created = 1;
-    }
+    // gh-117783: immortalize objects that would use deferred refcounting
+    // once the first non-main thread is created (but not in subinterpreters).
+    gcstate->immortalize = _Py_IsMainInterpreter(interp) ? 0 : -1;
 
     gcstate->garbage = PyList_New(0);
     if (gcstate->garbage == NULL) {
@@ -987,7 +988,6 @@ cleanup_worklist(struct worklist *worklist)
 {
     PyObject *op;
     while ((op = worklist_pop(worklist)) != NULL) {
-        gc_restore_tid(op);
         gc_clear_unreachable(op);
         Py_DECREF(op);
     }
@@ -1164,7 +1164,8 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     if (gcstate->debug & _PyGC_DEBUG_STATS) {
         PySys_WriteStderr("gc: collecting generation %d...\n", generation);
         show_stats_each_generations(gcstate);
-        t1 = _PyTime_PerfCounterUnchecked();
+        // ignore error: don't interrupt the GC if reading the clock fails
+        (void)PyTime_PerfCounterRaw(&t1);
     }
 
     if (PyDTrace_GC_START_ENABLED()) {
@@ -1184,7 +1185,9 @@ gc_collect_main(PyThreadState *tstate, int generation, _PyGC_Reason reason)
     n = state.uncollectable;
 
     if (gcstate->debug & _PyGC_DEBUG_STATS) {
-        double d = PyTime_AsSecondsDouble(_PyTime_PerfCounterUnchecked() - t1);
+        PyTime_t t2;
+        (void)PyTime_PerfCounterRaw(&t2);
+        double d = PyTime_AsSecondsDouble(t2 - t1);
         PySys_WriteStderr(
             "gc: done, %zd unreachable, %zd uncollectable, %.4fs elapsed\n",
             n+m, n, d);
@@ -1807,8 +1810,10 @@ _PyGC_ImmortalizeDeferredObjects(PyInterpreterState *interp)
 {
     struct visitor_args args;
     _PyEval_StopTheWorld(interp);
-    gc_visit_heaps(interp, &immortalize_visitor, &args);
-    interp->gc.immortalize.enabled = 1;
+    if (interp->gc.immortalize == 0) {
+        gc_visit_heaps(interp, &immortalize_visitor, &args);
+        interp->gc.immortalize = 1;
+    }
     _PyEval_StartTheWorld(interp);
 }
 

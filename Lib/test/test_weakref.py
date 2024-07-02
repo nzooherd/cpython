@@ -17,6 +17,7 @@ from test.support import script_helper, ALWAYS_EQ, suppress_immortalization
 from test.support import gc_collect
 from test.support import import_helper
 from test.support import threading_helper
+from test.support import is_wasi, Py_DEBUG
 
 # Used in ReferencesTestCase.test_ref_created_during_del() .
 ref_from_del = None
@@ -81,7 +82,7 @@ class TestBase(unittest.TestCase):
 
 
 @contextlib.contextmanager
-def collect_in_thread(period=0.0001):
+def collect_in_thread(period=0.005):
     """
     Ensure GC collections happen in a different thread, at a high frequency.
     """
@@ -960,6 +961,7 @@ class ReferencesTestCase(TestBase):
         self.assertEqual(hash(a), hash(42))
         self.assertRaises(TypeError, hash, b)
 
+    @unittest.skipIf(is_wasi and Py_DEBUG, "requires deep stack")
     def test_trashcan_16602(self):
         # Issue #16602: when a weakref's target was part of a long
         # deallocation chain, the trashcan mechanism could delay clearing
@@ -2023,6 +2025,7 @@ class MappingTestCase(TestBase):
             raise exc[0]
 
     @threading_helper.requires_working_threading()
+    @support.requires_resource('cpu')
     def test_threaded_weak_key_dict_copy(self):
         # Issue #35615: Weakref keys or values getting GC'ed during dict
         # copying should not result in a crash.
@@ -2036,6 +2039,7 @@ class MappingTestCase(TestBase):
         self.check_threaded_weak_dict_copy(weakref.WeakKeyDictionary, True)
 
     @threading_helper.requires_working_threading()
+    @support.requires_resource('cpu')
     def test_threaded_weak_value_dict_copy(self):
         # Issue #35615: Weakref keys or values getting GC'ed during dict
         # copying should not result in a crash.
